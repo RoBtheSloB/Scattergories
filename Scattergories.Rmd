@@ -1,0 +1,539 @@
+---
+title: "Scattergory Stattegories"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+```{r include=FALSE}
+library(flexdashboard)
+library(htmlwidgets)
+library(jsonlite)
+library(gridExtra)
+library(readr)
+library(ggthemes)
+library(scales)
+library(zoo)
+library(knitr)
+library(kableExtra)
+library(RColorBrewer)
+library(shiny)
+library(DT)
+library(rsconnect)
+library(httr)
+library(readxl)
+library(tidyverse)
+
+options(dplyr.summarise.inform=F)
+
+```
+
+
+```{r include=FALSE}
+
+# setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+## Read in data
+RawScattergories <- read_xlsx("Scattergories Tracking.xlsx" ,sheet = "Data")
+
+## Getting the data into a better format
+ScattergoriesData <- RawScattergories %>% 
+  mutate_if(is.logical ,as.numeric) %>% 
+  pivot_longer(names_to = "Player" ,values_to = "Points" ,-c(SessionId ,RoundId ,Letter)) %>% 
+  filter(!is.na(Points)) %>% 
+  group_by(RoundId) %>% 
+  mutate(TopRoundScore      = max(Points)
+         ,TopRoundIndicator = as.numeric(Points == TopRoundScore)) %>% 
+  ungroup()
+
+## Letter List
+LetterOptions <- ScattergoriesData %>% 
+  select(Letter) %>% 
+  arrange(Letter) %>% 
+  unique() %>% 
+  pull()
+
+TotalUniqueLetters <- length(LetterOptions)
+
+## Total # of Sessions Played
+TotalSessions <- ScattergoriesData %>% 
+  summarise(SessionsPlayed = max(SessionId)) %>% 
+  pull()
+
+ChartRoundsPlayed <- ScattergoriesData %>% 
+  mutate(Id = str_c(SessionId ,"-" ,RoundId)) %>%
+  group_by(Player) %>% 
+  summarise(RoundsPlayed = n_distinct(Id)) %>% 
+  ungroup()
+
+```
+
+
+Scoreboard 
+=======================================================================
+
+Column {data-width=200 .sidebar}
+-----------------------------------------------------------------------
+
+### Filters
+
+```{r}
+
+sliderInput("input_session"
+            ,"Game Number:"
+            ,min = 1
+            ,max = TotalSessions
+            ,value = 1:TotalSessions
+            ,step = 1
+            )
+
+```
+
+
+Column {data-width=450}
+-----------------------------------------------------------------------
+
+### Avg Points per Round
+
+```{r}
+
+## Avg Points per Round
+ChartAvgScore <- reactive({
+  ScattergoriesData %>% 
+    filter(SessionId %in% input$input_session) %>% 
+    group_by(Player) %>% 
+    summarise(AvgPoints = mean(Points ,na.rm = TRUE)) %>% 
+    arrange(desc(AvgPoints))
+})
+
+## trying to set the legend breaks to make it more readable
+MaxAvgPoints <- reactive({floor(max(ChartAvgScore()$AvgPoints) * 10) / 10 - .1})
+MinAvgPoints <- reactive({ceiling(min(ChartAvgScore()$AvgPoints) * 10) / 10 + .1})
+AvgPointsStep <- reactive({round((MaxAvgPoints() - MinAvgPoints()) / 3 ,digits = 1)})
+
+renderPlot({
+  ChartAvgScore() %>% 
+    ggplot(aes(x = reorder(Player ,AvgPoints ,function(x) {x}) ,y = AvgPoints ,fill = AvgPoints)) +
+    geom_col() +
+    coord_flip() +
+    labs(x = "Player") +
+    scale_fill_gradientn(colors = c("darkred", "tomato1" ,"palegreen" ,"darkgreen")
+                         ,breaks = seq(from = MinAvgPoints() ,to = MaxAvgPoints() ,by = AvgPointsStep())
+                         ) +    
+    theme_fivethirtyeight()
+})
+
+
+```
+
+### Games Won
+
+```{r}
+
+## Sessions Won
+ChartSessionsWon <- reactive({
+  ScattergoriesData %>% 
+    filter(SessionId %in% input$input_session) %>% 
+    group_by(SessionId ,Player) %>% 
+    summarise(TotalPoints = sum(Points)) %>% 
+    ungroup() %>% 
+    group_by(SessionId) %>% 
+    mutate(MaxPoints   = max(TotalPoints)
+           ,SessionWon = as.numeric(MaxPoints == TotalPoints)) %>% 
+    ungroup() %>% 
+    group_by(Player) %>% 
+    summarise(TotalSessionsWon = sum(SessionWon)) %>% 
+    ungroup() %>% 
+    arrange(desc(TotalSessionsWon))
+})
+
+renderPlot({
+  ChartSessionsWon() %>% 
+    ggplot(aes(x = Player ,y = TotalSessionsWon)) +
+      geom_col(fill = "gold") +
+      coord_flip() +
+      labs(x = "Player") +
+      scale_y_continuous(breaks = function(x) {unique(floor(pretty(seq(0 ,(max(x + 1) * 1.1)))))}) + # integer breaks
+      theme_fivethirtyeight() 
+})
+
+```
+
+
+Column {data-width=350}
+-----------------------------------------------------------------------
+
+### Total Games Played
+
+```{r}
+
+renderValueBox({
+  valueBox(length(input$input_session)
+           ,icon = "fa fa-sort-alpha-asc"
+           )  
+})
+
+```
+
+### Rounds with Top Score
+
+```{r}
+
+## Number of Rounds with Top Score
+ChartTopRounds <- reactive({
+  ScattergoriesData %>% 
+    filter(SessionId %in% input$input_session) %>% 
+    group_by(Player) %>% 
+    summarise(TopRounds = sum(TopRoundIndicator)) %>% 
+    ungroup() %>% 
+    arrange(desc(TopRounds))
+})
+
+renderPlot({
+  ChartTopRounds() %>% 
+    ggplot(aes(x = reorder(Player ,TopRounds ,function(x) {x}) ,y = TopRounds ,fill = TopRounds)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_gradientn(colors = c("darkred", "tomato1" ,"palegreen" ,"darkgreen")) +
+    labs(x = "Player") +
+    theme_fivethirtyeight() 
+})
+
+```
+
+### Points over Time
+
+```{r}
+
+## Points Over Time
+## Need to have a starting point at 0,0
+## Getting a dataset that can be appended and used for this 
+## ... there's probably a more elegant solution this
+StartingPointData <- ScattergoriesData %>% 
+  select(Player) %>% 
+  unique() %>% 
+  mutate(PlayerCountId     = 0
+         ,CumulativePoints = 0)
+
+ChartPointsOverTime <- reactive({
+  ScattergoriesData %>%
+    filter(SessionId %in% input$input_session) %>% 
+    arrange(Player ,SessionId ,RoundId) %>% 
+    group_by(Player) %>% 
+    mutate(PlayerCountId     = row_number()
+           ,CumulativePoints = cumsum(Points)) %>% 
+    ungroup() %>% 
+    bind_rows(StartingPointData) %>% 
+    select(PlayerCountId ,Player ,CumulativePoints) %>% 
+    arrange(Player ,PlayerCountId ,CumulativePoints) 
+})
+  
+renderPlot({
+  ChartPointsOverTime() %>% 
+    select(PlayerCountId ,CumulativePoints ,Player) %>% 
+    ggplot(aes(x = PlayerCountId ,y = CumulativePoints ,color = Player)) +
+      geom_line(alpha = 0.64 ,size = 1) +
+      scale_y_continuous(labels = comma ,breaks = pretty_breaks()) +
+      theme_fivethirtyeight()
+})
+
+```
+
+
+Player Page
+=======================================================================
+
+Column {data-width=200 .sidebar}
+-----------------------------------------------------------------------
+
+### Filters
+
+```{r}
+
+TopPlayer <- ScattergoriesData %>% 
+  group_by(Player) %>% 
+  summarise(TopRounds = sum(TopRoundIndicator)) %>% 
+  ungroup() %>% 
+  arrange(desc(TopRounds) ,Player) %>% 
+  select(Player) %>% 
+  slice(1) %>% 
+  pull()
+
+PlayerVector <- ScattergoriesData %>% 
+  select(Player) %>% 
+  arrange(Player) %>% 
+  unique() %>% 
+  pull()
+
+selectInput("input_player"
+            ,"Select player:"
+            ,choices = sort(PlayerVector)
+            ,selected = TopPlayer
+            )
+
+```
+
+
+Column {data-width=450}
+-----------------------------------------------------------------------
+
+### Score Distribution
+
+```{r}
+
+## Score Distribution by Player
+ChartScoreDistribution <- reactive({
+  ScattergoriesData %>% 
+    group_by(Player ,Points) %>% 
+    summarise(Count = n()) %>% 
+    ungroup() %>% 
+    filter(Player == input$input_player)
+})
+
+MinScore <- ScattergoriesData %>% 
+  summarise(MinScore = min(Points ,na.rm = TRUE)) %>% 
+  pull()
+
+MaxScore <- ScattergoriesData %>% 
+  summarise(MaxScore = max(Points ,na.rm = TRUE)) %>% 
+  pull()
+
+
+BaseScore <- tibble(
+  Points = c(MinScore:MaxScore)
+)
+
+renderPlot({
+  BaseScore %>% 
+    left_join(ChartScoreDistribution() %>% filter(Player == input$input_player) ,by = "Points") %>% 
+    ggplot(aes(x = as.factor(Points) ,y = Count ,fill = as.factor(Points))) +
+      geom_col() +
+      coord_flip() +
+      scale_y_continuous(breaks = function(x) {unique(floor(pretty(seq(0 ,(max(x + 1) * 1.1)))))}) + # integer breaks
+      scale_fill_brewer(palette = "RdYlGn") +
+      labs(x = "Player") +
+      theme_fivethirtyeight() +
+      theme(legend.position="none")
+})
+
+```
+
+### Score Difference by Coworker
+
+```{r}
+
+## Plus Minus by Opponent
+OpponentData <- ScattergoriesData %>% 
+  select(SessionId ,RoundId ,Opponent = Player ,OpponentPoints = Points)
+  
+ChartPlusMinus <- ScattergoriesData %>% 
+  left_join(OpponentData ,by = c("SessionId" ,"RoundId")) %>% 
+  arrange(Player ,SessionId ,RoundId) %>% 
+  filter(Player != Opponent) %>% 
+  mutate(PlusMinus = Points - OpponentPoints) %>% 
+  group_by(Player ,Opponent) %>% 
+  summarise(PlusMinus = sum(PlusMinus)) %>% 
+  ungroup()
+
+renderPlot({
+  ChartPlusMinus %>% 
+    filter(Player == input$input_player) %>% 
+    mutate(Classifier = if_else(PlusMinus > 0 ,"positive" ,"negative")) %>% 
+    ggplot(aes(x = reorder(Opponent ,PlusMinus ,function(x) {x}) ,y = PlusMinus)) +
+      geom_col() +
+      coord_flip() +
+      scale_y_continuous(breaks = pretty_breaks()) + 
+      # scale_fill_brewer(palette = "RdYlGn") +
+      labs(x = "Player") +
+      theme_fivethirtyeight() # +
+      # theme(legend.position="none")
+})
+
+
+```
+
+
+```{r include=FALSE}
+### Score Distribution by Game Number
+
+renderPlot({
+  ScattergoriesData %>% 
+    filter(Player == input$input_player) %>% 
+    ggplot(aes(x = SessionId ,y = Points)) +
+      geom_violin(aes(group = SessionId) ,draw_quantiles = c(0.5)) +
+      geom_jitter(height = 0, width = 0.05) +
+      geom_smooth(se = FALSE) +
+      scale_x_continuous(breaks = function(x) {unique(floor(pretty(seq(0 ,(max(x + 1) * 1.1)))))}) + #   integer breaks
+      theme_fivethirtyeight() 
+})
+  
+```
+
+
+Column {data-width=350}
+-----------------------------------------------------------------------
+
+### Total Rounds Played
+
+```{r}
+
+## Rounds Count
+TotalRoundsPlayed <- ScattergoriesData %>% 
+  group_by(Player) %>% 
+  mutate(Id = str_c(SessionId ,"-" ,RoundId)) %>% 
+  summarise(RoundsPlayed = n_distinct(Id))
+
+renderValueBox({
+  valueBox(TotalRoundsPlayed %>% 
+             filter(Player == input$input_player) %>% 
+             select(RoundsPlayed) %>% 
+             pull()
+           ,icon = "fa fa-pencil"
+           )  
+})
+
+```
+
+
+### Avg Score by Letter
+
+```{r}
+
+ChartScoreByLetter <- ScattergoriesData %>% 
+    group_by(Player ,Letter) %>% 
+    summarise(AvgScore = mean(Points ,na.rm = TRUE)) %>% 
+    ungroup()
+
+renderPlot({
+   ChartScoreByLetter %>% 
+    filter(Player == input$input_player) %>% 
+    ggplot(aes(x = reorder(Letter ,AvgScore ,function(x) {x}) ,y = AvgScore ,fill = AvgScore)) +
+      geom_col() +
+      coord_flip() +
+      scale_y_continuous(breaks = pretty_breaks()) + 
+      scale_fill_gradientn(colors = c("darkred", "tomato1" ,"palegreen" ,"darkgreen")) +
+      # scale_fill_brewer(palette = "RdYlGn") +
+      labs(x = "Player") +
+      theme_fivethirtyeight() # +
+      # theme(legend.position="none")
+})
+
+```
+
+
+### Avg Score minus Letter Avg
+
+```{r}
+
+## Avg Score by Letter
+ChartLetterAvg <- ScattergoriesData %>% 
+  group_by(Letter) %>% 
+  summarise(AvgLetterScore = mean(Points ,na.rm = TRUE)) %>% 
+  arrange(desc(AvgLetterScore)) %>% 
+  ungroup()
+
+renderPlot({
+  ChartScoreByLetter %>% 
+    left_join(ChartLetterAvg ,by = "Letter") %>% 
+    mutate(AvgMinusLetterAvg = AvgScore - AvgLetterScore) %>% 
+    filter(Player == input$input_player) %>% 
+    ggplot(aes(x = reorder(Letter ,AvgMinusLetterAvg ,function(x) {x}) ,y = AvgMinusLetterAvg ,fill = AvgMinusLetterAvg)) +
+      geom_col() +
+      coord_flip() +
+      scale_y_continuous(breaks = pretty_breaks()) + 
+      scale_fill_gradientn(colors = c("darkred", "tomato1" ,"palegreen" ,"darkgreen")) +
+      # scale_fill_brewer(palette = "RdYlGn") +
+      labs(x = "Player") +
+      theme_fivethirtyeight() # +
+      # theme(legend.position="none")
+})
+
+```
+
+
+Game Recaps
+=======================================================================
+
+```{r}
+
+## Getting some different stats together for a round summary
+TableRounds <- ScattergoriesData %>% 
+  group_by(SessionId) %>% 
+  summarise(RoundCount = max(RoundId)) %>% 
+  ungroup()
+
+TableLetters <- ScattergoriesData %>% 
+  select(SessionId , Letter) %>% 
+  unique() %>% 
+  arrange(SessionId ,Letter) %>% 
+  group_by(SessionId) %>% 
+  summarise(Letters = str_c(Letter ,collapse = ", ")) %>% 
+  ungroup()
+
+MaxMinScores <- ScattergoriesData %>% 
+  group_by(SessionId , Letter) %>% 
+  summarise(LetterScore  = sum(Points ,na.rm = TRUE)
+            ,PlayerCount = n()) %>% 
+  ungroup() %>% 
+  group_by(SessionId) %>% 
+  mutate(MaxScore  = max(LetterScore)
+         ,MinScore = min(LetterScore)
+         ,AvgScore = LetterScore / PlayerCount) %>% 
+  ungroup() %>% 
+  arrange(desc(LetterScore)) 
+
+TableMaxLetterScore <- MaxMinScores %>% 
+  filter(LetterScore == MaxScore) %>% 
+  group_by(SessionId) %>% 
+  summarise(BestLetter = str_c(Letter ,collapse = ", ")
+            ,AvgScore  = mean(AvgScore)) %>% 
+  ungroup() %>% 
+  mutate(BestLetter = str_c(BestLetter ," - " ,AvgScore ," avg")) %>% 
+  select(-AvgScore)
+  
+TableMinLetterScore <- MaxMinScores %>% 
+  filter(LetterScore == MinScore) %>% 
+  group_by(SessionId) %>% 
+  summarise(WorstLetter = str_c(Letter ,collapse = ", ")
+            ,AvgScore   = mean(AvgScore)) %>% 
+  ungroup() %>% 
+  mutate(WorstLetter = str_c(WorstLetter ," - " ,AvgScore ," avg")) %>% 
+  select(-AvgScore)
+  
+TableTopPlayer <- ScattergoriesData %>% 
+  group_by(SessionId , Player) %>% 
+  summarise(PlayerScore  = sum(Points ,na.rm = TRUE)
+            ,Count       = n()
+            ,PlayerAvg   = mean(Points ,na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  group_by(SessionId) %>% 
+  mutate(MaxAvg = max(PlayerAvg)) %>% 
+  ungroup() %>% 
+  filter(PlayerAvg == MaxAvg) %>% 
+  group_by(SessionId) %>% 
+  summarise(TopScorer = str_c(Player ,collapse = ", ")
+            ,MaxAvg   = mean(MaxAvg ,na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  mutate(TopScorer = str_c(TopScorer ," - " ,MaxAvg ," avg")) %>% 
+  select(-MaxAvg)
+
+TableRounds %>% 
+  left_join(TableLetters ,by = "SessionId") %>% 
+  left_join(TableMaxLetterScore ,by = "SessionId") %>% 
+  left_join(TableMinLetterScore ,by = "SessionId") %>% 
+  left_join(TableTopPlayer ,by = "SessionId") %>% 
+  datatable(colnames = c("Game Number" 
+                         ,"Number of Rounds"
+                         ,"Letters"
+                         ,"Highest Scoring Letter"
+                         ,"Lowest Scoring Letter"
+                         ,"Top Scorer"
+                         )
+            ,rownames = FALSE
+            )
+  
+
+```
+
